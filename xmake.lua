@@ -14,6 +14,8 @@ add_rules("plugin.vsxmake.autoupdate")
 
 -- define targets
 target("Respite")
+    set_kind("shared")
+
     add_rules("commonlibsse-ng.plugin", {
         name = "Respite",
         author = "hoskope",
