@@ -1,3 +1,6 @@
+-- enable CommonLibSSE-NG's built-in INI support
+set_config("rex_ini", true)
+
 -- include subprojects
 includes("lib/commonlibsse-ng")
 
@@ -25,5 +28,5 @@ target("Respite")
     -- add src files
     add_files("src/**.cpp")
     add_headerfiles("src/**.h")
-    add_includedirs("src")
+    add_includedirs("src", "lib/skse-menu-framework/include")
     set_pcxxheader("src/pch.h")

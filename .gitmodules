@@ -2,3 +2,6 @@
 	path = lib/commonlibsse-ng
 	url = https://github.com/alandtse/CommonLibSSE-NG.git
 	branch = ng
+[submodule "lib/skse-menu-framework"]
+	path = lib/skse-menu-framework
+	url = https://github.com/QTR-Modding/SKSE-Menu-Framework-3-Example.git
