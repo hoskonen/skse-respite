@@ -19,13 +19,22 @@ namespace Respite::Menu
 
 			int policy = static_cast<int>(context.policy);
 			constexpr const char* policies[]{ "Normal", "Interval", "OncePerActivation", "Disabled" };
+			constexpr const char* explorationPolicies[]{ "Normal", "Interval", "Disabled" };
+			const bool exploration = a_context == MusicContext::kExploration;
+			if (exploration) {
+				policy = 0;
+				for (std::size_t i = 0; i < Settings::kExplorationPolicies.size(); ++i) {
+					if (Settings::kExplorationPolicies[i] == context.policy) policy = static_cast<int>(i);
+				}
+			}
 			const auto policyLabel = std::format("Policy##{}", ContextName(a_context));
-			if (ImGuiMCP::Combo(policyLabel.c_str(), &policy, policies, static_cast<int>(std::size(policies)))) {
-				context.policy = static_cast<Settings::Policy>(policy);
+			if (ImGuiMCP::Combo(policyLabel.c_str(), &policy, exploration ? explorationPolicies : policies,
+				exploration ? static_cast<int>(std::size(explorationPolicies)) : static_cast<int>(std::size(policies)))) {
+				context.policy = exploration ? Settings::kExplorationPolicies[policy] : static_cast<Settings::Policy>(policy);
 				a_changed = true;
 			}
 
-			if (context.policy == Settings::Policy::kInterval) {
+			if (a_values.UsesInterval(a_context)) {
 				const auto minimumLabel = std::format("Minimum silence seconds##{}", ContextName(a_context));
 				if (ImGuiMCP::SliderFloat(minimumLabel.c_str(), &context.minimumSilenceSeconds,
 						Settings::kMinimumSilenceSeconds, Settings::kMaximumSilenceSeconds, "%.0f s")) {
@@ -37,6 +46,21 @@ namespace Respite::Menu
 						Settings::kMinimumSilenceSeconds, Settings::kMaximumSilenceSeconds, "%.0f s")) {
 					context.minimumSilenceSeconds = (std::min)(context.minimumSilenceSeconds, context.maximumSilenceSeconds);
 					a_changed = true;
+				}
+			}
+			if (a_context == MusicContext::kExploration && ImGuiMCP::CollapsingHeader("Advanced overrides##Exploration")) {
+				ImGuiMCP::TextWrapped("Inherit uses Exploration's policy. Interval overrides use the Exploration silence range. Unresolved Day/Night evidence uses the parent policy.");
+				constexpr const char* overrides[]{ "Inherit", "Normal", "Interval", "Disabled" };
+				for (const auto subcontext : { MusicSubcontext::kExplorationDay, MusicSubcontext::kExplorationNight }) {
+					auto& value = a_values.overrides[static_cast<std::size_t>(subcontext)];
+					int selected = 0;
+					for (std::size_t i = 0; i < Settings::kExplorationOverrides.size(); ++i) {
+						if (Settings::kExplorationOverrides[i] == value) selected = static_cast<int>(i);
+					}
+					if (ImGuiMCP::Combo(SubcontextName(subcontext).data(), &selected, overrides, static_cast<int>(std::size(overrides)))) {
+						value = Settings::kExplorationOverrides[selected];
+						a_changed = true;
+					}
 				}
 			}
 		}
@@ -54,8 +78,8 @@ namespace Respite::Menu
 
 			ImGuiMCP::Spacing();
 			ImGuiMCP::SeparatorText("Diagnostics");
-			changed |= ImGuiMCP::Checkbox("Debug logging", &settings.debugLogging);
-			changed |= ImGuiMCP::Checkbox("Current-music diagnostics", &settings.currentMusicDiagnostics);
+			changed |= ImGuiMCP::Checkbox("Internal debug logging", &settings.debugLogging);
+			changed |= ImGuiMCP::Checkbox("Verbose/current-music diagnostics", &settings.currentMusicDiagnostics);
 
 			if (changed) {
 				Settings::Update(settings);

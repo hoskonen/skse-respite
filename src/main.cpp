@@ -13,28 +13,28 @@ namespace
 
 		switch (a_message->type) {
 		case SKSE::MessagingInterface::kPostLoad:
-			logs::info("SKSE lifecycle: PostLoad");
+			logs::debug("[lifecycle] PostLoad");
 			Respite::Menu::Register();
 			break;
 		case SKSE::MessagingInterface::kPostPostLoad:
-			logs::info("SKSE lifecycle: PostPostLoad");
+			logs::debug("[lifecycle] PostPostLoad");
 			break;
 		case SKSE::MessagingInterface::kInputLoaded:
-			logs::info("SKSE lifecycle: InputLoaded");
+			logs::debug("[lifecycle] InputLoaded");
 			break;
 		case SKSE::MessagingInterface::kDataLoaded:
-			logs::info("SKSE lifecycle: DataLoaded");
+			logs::info("[lifecycle] DataLoaded; policy state reset");
 			Respite::PolicyEngine::Reset("kDataLoaded", true);
 			Respite::Observability::OnDataLoaded();
 			break;
 		case SKSE::MessagingInterface::kPreLoadGame:
-			logs::info("SKSE lifecycle: PreLoadGame");
+			logs::info("[lifecycle] PreLoadGame; policy state suspended");
 			Respite::PolicyEngine::Reset("kPreLoadGame", false);
 			Respite::Observability::OnPreLoadGame();
 			break;
 		case SKSE::MessagingInterface::kPostLoadGame: {
 			const bool succeeded = a_message->data != nullptr;
-			logs::info("SKSE lifecycle: PostLoadGame success={}", succeeded);
+			logs::info("[lifecycle] PostLoadGame success={}; policy state reset", succeeded);
 			Respite::PolicyEngine::Reset(
 				succeeded ? "kPostLoadGame(success)" : "kPostLoadGame(failure)",
 				succeeded);
@@ -42,13 +42,13 @@ namespace
 			break;
 		}
 		case SKSE::MessagingInterface::kSaveGame:
-			logs::info("SKSE lifecycle: SaveGame");
+			logs::debug("[lifecycle] SaveGame");
 			break;
 		case SKSE::MessagingInterface::kDeleteGame:
-			logs::info("SKSE lifecycle: DeleteGame");
+			logs::debug("[lifecycle] DeleteGame");
 			break;
 		case SKSE::MessagingInterface::kNewGame:
-			logs::info("SKSE lifecycle: NewGame");
+			logs::info("[lifecycle] NewGame; policy state reset");
 			Respite::PolicyEngine::Reset("kNewGame", true);
 			Respite::Observability::OnNewGame();
 			break;
@@ -62,7 +62,7 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 {
 	SKSE::Init(a_skse);
 
-	logs::info("Respite diagnostic observability is loading");
+	logs::info("Respite is loading");
 
 	try {
 		Respite::Settings::Load();
@@ -74,10 +74,10 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 			return false;
 		}
 	} catch (const std::exception& e) {
-		logs::critical("Failed to install diagnostic observability: {}", e.what());
+		logs::critical("Failed to initialize Respite: {}", e.what());
 		return false;
 	} catch (...) {
-		logs::critical("Failed to install diagnostic observability: unknown exception");
+		logs::critical("Failed to initialize Respite: unknown exception");
 		return false;
 	}
 

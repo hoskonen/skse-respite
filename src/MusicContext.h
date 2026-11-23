@@ -2,6 +2,23 @@
 
 namespace Respite
 {
+	enum class MusicSubcontext : std::uint8_t
+	{
+		kNone,
+		kExplorationDay,
+		kExplorationNight,
+		kCount
+	};
+
+	[[nodiscard]] constexpr std::string_view SubcontextName(MusicSubcontext a_subcontext) noexcept
+	{
+		switch (a_subcontext) {
+		case MusicSubcontext::kExplorationDay: return "Day";
+		case MusicSubcontext::kExplorationNight: return "Night";
+		default: return "None";
+		}
+	}
+
 	enum class MusicContext : std::uint8_t
 	{
 		kExploration,

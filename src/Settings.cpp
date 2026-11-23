@@ -12,7 +12,7 @@ namespace Respite::Settings
 
 		std::mutex g_settingsLock;
 		Values g_values;
-		std::atomic_bool g_currentMusicDiagnostics{ true };
+		std::atomic_bool g_currentMusicDiagnostics{ false };
 
 		void Configure(CSimpleIniA& a_ini)
 		{
@@ -47,8 +47,17 @@ namespace Respite::Settings
 		[[nodiscard]] bool Validate(Values& a_values) noexcept
 		{
 			bool adjusted{};
-			for (auto& context : a_values.contexts) {
-				adjusted |= Validate(context);
+			for (const auto context : kManagedMusicContexts) {
+				auto& settings = a_values.For(context);
+				adjusted |= Validate(settings);
+				const auto policy = NormalizePolicy(context, settings.policy);
+				adjusted |= policy != settings.policy;
+				settings.policy = policy;
+			}
+			for (auto& override : a_values.overrides) {
+				const auto normalized = NormalizeExplorationOverride(override);
+				adjusted |= normalized != override;
+				override = normalized;
 			}
 			return adjusted;
 		}
@@ -60,25 +69,12 @@ namespace Respite::Settings
 			spdlog::flush_on(level);
 		}
 
-		[[nodiscard]] Policy ParsePolicy(std::string_view a_value, bool& a_recognized) noexcept
-		{
-			for (const auto policy : { Policy::kNormal, Policy::kInterval, Policy::kOncePerActivation, Policy::kDisabled }) {
-				if (a_value == PolicyName(policy)) {
-					a_recognized = true;
-					return policy;
-				}
-			}
-
-			a_recognized = false;
-			return Policy::kNormal;
-		}
-
 		void LoadContext(CSimpleIniA& a_ini, MusicContext a_context, Values& a_values, bool& a_recognizedPolicies)
 		{
 			auto& settings = a_values.For(a_context);
 			const auto section = ContextName(a_context);
 			bool recognized = true;
-			settings.policy = ParsePolicy(
+			settings.policy = ParseContextPolicy(a_context,
 				a_ini.GetValue(section.data(), "Policy", PolicyName(settings.policy).data()),
 				recognized);
 			a_recognizedPolicies &= recognized;
@@ -105,6 +101,12 @@ namespace Respite::Settings
 		(void) adjusted;
 		{
 			std::scoped_lock lock{ g_settingsLock };
+			for (const auto context : kManagedMusicContexts) {
+				const auto index = ContextIndex(context);
+				const bool changed = g_values.For(context).policy != a_values.For(context).policy ||
+					(context == MusicContext::kExploration && g_values.overrides != a_values.overrides);
+				a_values.policyRevisions[index] = g_values.policyRevisions[index] + (changed ? 1 : 0);
+			}
 			g_values = a_values;
 		}
 		g_currentMusicDiagnostics.store(a_values.currentMusicDiagnostics, std::memory_order_relaxed);
@@ -128,6 +130,13 @@ namespace Respite::Settings
 					for (const auto context : kManagedMusicContexts) {
 						LoadContext(ini, context, loaded, recognizedPolicies);
 					}
+					for (const auto subcontext : { MusicSubcontext::kExplorationDay, MusicSubcontext::kExplorationNight }) {
+						const auto value = std::string_view{ ini.GetValue("Exploration.Overrides", SubcontextName(subcontext).data(), "Inherit") };
+						auto& override = loaded.overrides[static_cast<std::size_t>(subcontext)];
+						bool recognized{};
+						override = ParseExplorationOverride(value, recognized);
+						if (!recognized) logs::warn("Unsupported or unknown Exploration {} override '{}'; using Inherit", SubcontextName(subcontext), value);
+					}
 
 					loaded.debugLogging = ini.GetBoolValue(kDiagnosticsSection, "DebugLogging", loaded.debugLogging);
 					loaded.currentMusicDiagnostics = ini.GetBoolValue(
@@ -146,20 +155,26 @@ namespace Respite::Settings
 		const bool adjusted = Validate(loaded);
 		Update(loaded);
 		if (!recognizedPolicies) {
-			logs::warn("Unknown policy in {}; affected contexts use Normal", kSettingsPath);
+			logs::warn("Unsupported or unknown policy in {}; affected contexts use Normal", kSettingsPath);
 		}
 		if (adjusted) {
 			logs::warn("Adjusted invalid settings loaded from {}", kSettingsPath);
 		}
-		logs::info("Settings active: enabled={} debugLogging={} currentMusicDiagnostics={}", loaded.enabled, loaded.debugLogging, loaded.currentMusicDiagnostics);
-		for (const auto context : kManagedMusicContexts) {
-			const auto& settings = loaded.For(context);
-			logs::info(
-				"  {} policy={} interval={}..{}s",
-				ContextName(context),
-				PolicyName(settings.policy),
-				settings.minimumSilenceSeconds,
-				settings.maximumSilenceSeconds);
+		logs::info(
+			"[settings] enabled={} Exploration={} Town={} Tavern={} Dungeon={} verbose={}",
+			loaded.enabled,
+			PolicyName(loaded.For(MusicContext::kExploration).policy),
+			PolicyName(loaded.For(MusicContext::kTown).policy),
+			PolicyName(loaded.For(MusicContext::kTavern).policy),
+			PolicyName(loaded.For(MusicContext::kDungeon).policy),
+			loaded.currentMusicDiagnostics);
+		if (loaded.debugLogging) {
+			for (const auto context : kManagedMusicContexts) {
+				const auto& settings = loaded.For(context);
+				logs::debug("[settings] context={} policy={} interval={:.1f}..{:.1f}s",
+					ContextName(context), PolicyName(settings.policy),
+					settings.minimumSilenceSeconds, settings.maximumSilenceSeconds);
+			}
 		}
 	}
 
@@ -187,6 +202,10 @@ namespace Respite::Settings
 				ini.SetDoubleValue(section.data(), "MaximumSilenceSeconds", settings.maximumSilenceSeconds);
 			}
 			ini.SetBoolValue(kDiagnosticsSection, "DebugLogging", snapshot.debugLogging);
+			for (const auto subcontext : { MusicSubcontext::kExplorationDay, MusicSubcontext::kExplorationNight }) {
+				ini.SetValue("Exploration.Overrides", SubcontextName(subcontext).data(),
+					OverrideName(snapshot.overrides[static_cast<std::size_t>(subcontext)]).data());
+			}
 			ini.SetBoolValue(kDiagnosticsSection, "CurrentMusicDiagnostics", snapshot.currentMusicDiagnostics);
 
 			const auto result = ini.SaveFile(kSettingsPath);
@@ -208,18 +227,9 @@ namespace Respite::Settings
 		return g_currentMusicDiagnostics.load(std::memory_order_relaxed);
 	}
 
-	std::string_view PolicyName(Policy a_policy) noexcept
+	std::string_view OverrideName(PolicyOverride a_override) noexcept
 	{
-		switch (a_policy) {
-		case Policy::kInterval:
-			return "Interval";
-		case Policy::kOncePerActivation:
-			return "OncePerActivation";
-		case Policy::kDisabled:
-			return "Disabled";
-		case Policy::kNormal:
-		default:
-			return "Normal";
-		}
+		if (a_override == PolicyOverride::kInherit) return "Inherit";
+		return PolicyName(static_cast<Policy>(static_cast<unsigned>(a_override) - 1));
 	}
 }

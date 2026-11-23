@@ -7,6 +7,8 @@ namespace Respite::PmfPlaceholder
 		bool recognizedSlot{};
 		bool placeholder{};
 		RE::FormID localFormID{};
+		std::string_view category;
+		std::string_view targetMusicTypes;
 		std::string assetPath;
 	};
 

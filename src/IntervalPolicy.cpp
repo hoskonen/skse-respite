@@ -1,5 +1,7 @@
 #include "IntervalPolicy.h"
 
+#include <unordered_set>
+
 namespace Respite::IntervalPolicy
 {
 	namespace
@@ -12,11 +14,12 @@ namespace Respite::IntervalPolicy
 			RE::BSIMusicType* pendingType{};
 			RE::BSIMusicTrack* pendingTrack{};
 			Settings::PolicySettings pendingSettings{};
-			RE::BSIMusicType* managedType{};
+			RE::BSIMusicType* originType{};
 			Clock::time_point cooldownEnd{};
 			bool cooldownActive{};
-			bool suppressionLogged{};
-			RE::BSIMusicType* lastAllowedOtherType{};
+			std::unordered_set<RE::BSIMusicType*> suppressedTypes;
+			std::unordered_set<RE::BSIMusicType*> allowedOtherTypes;
+			std::unordered_set<RE::BGSMusicPaletteTrack*> blockedPalettes;
 		};
 
 		std::mutex g_stateLock;
@@ -27,14 +30,20 @@ namespace Respite::IntervalPolicy
 		void ClearLocked(MusicContext a_context) noexcept { g_states[ContextIndex(a_context)] = {}; }
 		void ClearAllLocked() noexcept { g_states = {}; }
 
-		void LogType(std::string_view a_message, MusicContext a_context, RE::BSIMusicType* a_type)
+		[[nodiscard]] std::string TypeName(RE::BSIMusicType* a_type)
 		{
 			if (const auto musicType = a_type ? skyrim_cast<RE::BGSMusicType*>(a_type) : nullptr) {
-				logs::info("[interval] {} context={} type={} form={:08X} editorID='{}'", a_message,
-					ContextName(a_context), static_cast<const void*>(a_type), musicType->GetFormID(), musicType->GetFormEditorID());
-			} else {
-				logs::info("[interval] {} context={} type={}", a_message, ContextName(a_context), static_cast<const void*>(a_type));
+				if (const std::string_view editorID{ musicType->GetFormEditorID() }; !editorID.empty()) {
+					return std::string{ editorID };
+				}
+				return std::format("{:08X}", musicType->GetFormID());
 			}
+			return a_type ? "__NoMusic" : "<null>";
+		}
+
+		[[nodiscard]] float RemainingSeconds(const State& a_state, Clock::time_point a_now) noexcept
+		{
+			return (std::max)(0.0F, std::chrono::duration<float>{ a_state.cooldownEnd - a_now }.count());
 		}
 
 		[[nodiscard]] float ChooseDuration(const Settings::PolicySettings& a_settings)
@@ -52,8 +61,7 @@ namespace Respite::IntervalPolicy
 			if (!state.cooldownActive || a_now < state.cooldownEnd) {
 				return;
 			}
-			LogType("cooldown expired", a_context, state.managedType);
-			LogType("managed type eligible again", a_context, state.managedType);
+			logs::info("[interval] cooldown expired context={} origin={}", ContextName(a_context), TypeName(state.originType));
 			ClearLocked(a_context);
 		}
 
@@ -63,13 +71,16 @@ namespace Respite::IntervalPolicy
 			auto& state = g_states[ContextIndex(a_context)];
 			const auto duration = ChooseDuration(a_settings);
 			state = {};
-			state.managedType = a_type;
+			state.originType = a_type;
 			state.cooldownEnd = a_now + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<float>{ duration });
 			state.cooldownActive = true;
-			LogType("cooldown started", a_context, a_type);
-			logs::info("[interval] completion track={} context={}", static_cast<const void*>(a_track), ContextName(a_context));
-			logs::info("[interval] chosen duration={:.3f}s context={} configuredRange={:.3f}..{:.3f}s", duration,
-				ContextName(a_context), a_settings.minimumSilenceSeconds, a_settings.maximumSilenceSeconds);
+			logs::info("[interval] cooldown started context={} type={} duration={:.1f}s",
+				ContextName(a_context), TypeName(a_type), duration);
+			if (Settings::CurrentMusicDiagnosticsEnabled()) {
+				logs::info("[interval-detail] owner={} completedTrack={} configuredRange={:.1f}..{:.1f}s",
+					static_cast<const void*>(a_type), static_cast<const void*>(a_track),
+					a_settings.minimumSilenceSeconds, a_settings.maximumSilenceSeconds);
+			}
 		}
 	}
 
@@ -82,6 +93,16 @@ namespace Respite::IntervalPolicy
 			ClearAllLocked();
 			g_runtimeEnabled.store(a_enable, std::memory_order_relaxed);
 		} catch (...) { logs::error("Interval policy exception while resetting state"); }
+	}
+
+	void ResetContext(MusicContext a_context, std::string_view a_reason) noexcept
+	{
+		try {
+			if (a_context == MusicContext::kUnmanaged || a_context == MusicContext::kCount) return;
+			std::scoped_lock lock{ g_stateLock };
+			ClearLocked(a_context);
+			logs::debug("[interval] context state reset context={} reason={}", ContextName(a_context), a_reason);
+		} catch (...) { logs::error("Interval policy exception while resetting context state"); }
 	}
 
 	void Update() noexcept
@@ -118,7 +139,6 @@ namespace Respite::IntervalPolicy
 			if (!g_runtimeEnabled.load(std::memory_order_relaxed) || a_context == MusicContext::kUnmanaged) return;
 			std::scoped_lock lock{ g_stateLock };
 			if (a_settings.policy != Settings::Policy::kInterval) {
-				ClearLocked(a_context);
 				return;
 			}
 			auto& state = g_states[ContextIndex(a_context)];
@@ -132,7 +152,8 @@ namespace Respite::IntervalPolicy
 		} catch (...) { logs::error("Interval policy exception while observing music type transition"); }
 	}
 
-	bool ShouldSuppressPlay(RE::BSIMusicType* a_type, const Settings::Values& a_settings) noexcept
+	bool ShouldSuppressPlay(RE::BSIMusicType* a_type, MusicContext a_typeContext,
+		const Settings::Values& a_settings, Settings::Policy a_resolvedPolicy) noexcept
 	{
 		try {
 			std::scoped_lock lock{ g_stateLock };
@@ -143,8 +164,7 @@ namespace Respite::IntervalPolicy
 			const auto now = Clock::now();
 			for (const auto context : kManagedMusicContexts) {
 				auto& state = g_states[ContextIndex(context)];
-				const auto& policy = a_settings.For(context);
-				if (policy.policy != Settings::Policy::kInterval) {
+				if (!a_settings.UsesInterval(context)) {
 					ClearLocked(context);
 					continue;
 				}
@@ -153,22 +173,68 @@ namespace Respite::IntervalPolicy
 					a_type->typeStatus == TypeStatus::kInactive) {
 					StartCooldownLocked(context, a_type, state.pendingTrack, state.pendingSettings, now);
 				}
-				if (!state.cooldownActive) continue;
-				if (a_type == state.managedType) {
-					if (!state.suppressionLogged) {
-						LogType("managed type replay suppressed", context, a_type);
-						state.suppressionLogged = true;
+			}
+
+			if (a_typeContext != MusicContext::kUnmanaged && a_resolvedPolicy == Settings::Policy::kInterval) {
+				auto& contextState = g_states[ContextIndex(a_typeContext)];
+				if (contextState.cooldownActive) {
+					if (contextState.suppressedTypes.insert(a_type).second) {
+						logs::info("[interval] suppressed context={} type={} remaining={:.1f}s",
+							ContextName(a_typeContext), TypeName(a_type), RemainingSeconds(contextState, now));
 					}
 					return true;
 				}
-				if (a_type && a_type != state.lastAllowedOtherType) {
-					LogType("other music type allowed during cooldown", context, a_type);
-					state.lastAllowedOtherType = a_type;
+			}
+
+			for (const auto cooldownContext : kManagedMusicContexts) {
+				auto& state = g_states[ContextIndex(cooldownContext)];
+				if (!state.cooldownActive || !state.allowedOtherTypes.insert(a_type).second) {
+					continue;
 				}
+				logs::info("[interval] bypass allowed cooldownContext={} type={} typeContext={}",
+					ContextName(cooldownContext), TypeName(a_type), ContextName(a_typeContext));
 			}
 			return false;
 		} catch (...) {
 			logs::error("Interval policy exception while evaluating playback; allowing native behavior");
+			return false;
+		}
+	}
+
+	bool IsContextCooldownActive(MusicContext a_context) noexcept
+	{
+		try {
+			if (a_context == MusicContext::kUnmanaged || a_context == MusicContext::kCount) {
+				return false;
+			}
+			std::scoped_lock lock{ g_stateLock };
+			const auto& state = g_states[ContextIndex(a_context)];
+			return g_runtimeEnabled.load(std::memory_order_relaxed) && state.cooldownActive &&
+			       Clock::now() < state.cooldownEnd;
+		} catch (...) {
+			return false;
+		}
+	}
+
+	bool BlockInactivePaletteUpdate(MusicContext a_context, RE::BSIMusicType* a_owner,
+		RE::BGSMusicPaletteTrack* a_palette) noexcept
+	{
+		try {
+			if (!a_owner || !a_palette || a_context == MusicContext::kUnmanaged || a_context == MusicContext::kCount) {
+				return false;
+			}
+			std::scoped_lock lock{ g_stateLock };
+			auto& state = g_states[ContextIndex(a_context)];
+			if (!g_runtimeEnabled.load(std::memory_order_relaxed) || !state.cooldownActive ||
+			    Clock::now() >= state.cooldownEnd) {
+				return false;
+			}
+			if (state.blockedPalettes.insert(a_palette).second) {
+				logs::info("[interval] blocked inactive palette update context={} type={}",
+					ContextName(a_context), TypeName(a_owner));
+			}
+			return true;
+		} catch (...) {
 			return false;
 		}
 	}

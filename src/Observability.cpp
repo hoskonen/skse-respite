@@ -1,5 +1,6 @@
 #include "Observability.h"
 
+#include "PaletteDiagnostics.h"
 #include "PolicyEngine.h"
 #include "Settings.h"
 
@@ -49,6 +50,8 @@ namespace Respite::Observability
 		ManagerSnapshot g_managerState;
 
 		thread_local RE::BSIMusicType* g_updatingType{};
+		thread_local RE::BGSMusicPaletteTrack* g_updatingPalette{};
+		thread_local bool g_wrapperPlayActive{};
 
 		[[nodiscard]] std::string_view TypeStatusName(std::uint32_t a_status) noexcept
 		{
@@ -444,7 +447,10 @@ namespace Respite::Observability
 				g_trackStates.clear();
 				g_managerState = {};
 			}
-			logs::info("[lifecycle] {}: diagnostic state reset", a_reason);
+			PaletteDiagnostics::Reset();
+			if (Settings::CurrentMusicDiagnosticsEnabled()) {
+				logs::info("[observability] state reset reason={}", a_reason);
+			}
 			g_observationEnabled.store(a_enable, std::memory_order_relaxed);
 			if (a_enable) {
 				ObserveManager(a_reason);
@@ -462,6 +468,19 @@ namespace Respite::Observability
 			~UpdatingTypeScope() { g_updatingType = previous; }
 
 			RE::BSIMusicType* previous;
+		};
+
+		struct UpdatingPaletteScope
+		{
+			explicit UpdatingPaletteScope(RE::BGSMusicPaletteTrack* a_palette) noexcept :
+				previous(g_updatingPalette)
+			{
+				g_updatingPalette = a_palette;
+			}
+
+			~UpdatingPaletteScope() { g_updatingPalette = previous; }
+
+			RE::BGSMusicPaletteTrack* previous;
 		};
 
 		struct MusicManagerProcessEventHook
@@ -499,10 +518,12 @@ namespace Respite::Observability
 			{
 				const auto before = CaptureType(a_type);
 				PolicyEngine::Update();
+				PaletteDiagnostics::BeforeTypeUpdate(a_type);
 				{
 					UpdatingTypeScope scope{ a_type };
 					func(a_type);
 				}
+				PaletteDiagnostics::AfterTypeUpdate(a_type);
 				const auto after = CaptureType(a_type);
 				if (before.status != after.status) {
 					PolicyEngine::OnTypeTransition(a_type, before.status, after.status);
@@ -522,7 +543,9 @@ namespace Respite::Observability
 		{
 			static void Thunk(RE::BSIMusicType* a_type)
 			{
+				PaletteDiagnostics::BeforeTypePlay(a_type);
 				if (PolicyEngine::ShouldSuppressPlay(a_type)) {
+					PaletteDiagnostics::TypePlaySuppressed(a_type);
 					return;
 				}
 
@@ -531,6 +554,7 @@ namespace Respite::Observability
 					UpdatingTypeScope scope{ a_type };
 					func(a_type);
 				}
+				PaletteDiagnostics::AfterTypePlay(a_type);
 				try {
 					ObserveType(a_type, before, "DoPlay");
 				} catch (...) {
@@ -567,6 +591,39 @@ namespace Respite::Observability
 			static inline REL::Relocation<decltype(Thunk)> func;
 		};
 
+		struct WrapperPlayHook
+		{
+			// BSIMusicTrack secondary-vtable this; do not treat it as TESForm*.
+			static void Thunk(RE::BSIMusicTrack* a_entry)
+			{
+				const bool topLevel = g_updatingType && !g_updatingPalette &&
+					std::find(g_updatingType->tracks.begin(), g_updatingType->tracks.end(), a_entry) != g_updatingType->tracks.end();
+				if (topLevel && PolicyEngine::ShouldSuppressSelectedPlay(g_updatingType, a_entry)) return;
+				struct Scope
+				{
+					bool previous{ g_wrapperPlayActive };
+					Scope() { g_wrapperPlayActive = true; }
+					~Scope() { g_wrapperPlayActive = previous; }
+				} scope;
+				func(a_entry);
+			}
+			static inline REL::Relocation<decltype(Thunk)> func;
+		};
+
+		RE::BSIMusicTrack* TopLevelEntryFor(RE::BSIMusicTrack* a_track)
+		{
+			if (!g_updatingType || g_updatingPalette || g_wrapperPlayActive) return nullptr;
+			RE::BSIMusicTrack* result{};
+			for (auto* entry : g_updatingType->tracks) {
+				auto* concrete = entry;
+				if (const auto wrapper = skyrim_cast<RE::BGSMusicTrackFormWrapper*>(entry)) concrete = wrapper->track;
+				if (concrete != a_track) continue;
+				if (result) return nullptr;  // Ambiguous ownership is not evidence.
+				result = entry;
+			}
+			return result;
+		}
+
 		template <class T, const char* KindName>
 		struct TrackHooks
 		{
@@ -574,7 +631,19 @@ namespace Respite::Observability
 			{
 				const auto before = CaptureTrack(a_track);
 				const auto owner = g_updatingType;
-				update(a_track);
+				if constexpr (std::same_as<T, RE::BGSMusicPaletteTrack>) {
+					if (PolicyEngine::ShouldBlockPaletteUpdate(owner, a_track)) {
+						return;
+					}
+					PaletteDiagnostics::BeforePaletteUpdate(a_track, owner);
+					{
+						UpdatingPaletteScope scope{ a_track };
+						update(a_track);
+					}
+					PaletteDiagnostics::AfterPaletteUpdate(a_track, owner);
+				} else {
+					update(a_track);
+				}
 				const auto after = CaptureTrack(a_track);
 				bool finishRequested{};
 				{
@@ -605,8 +674,28 @@ namespace Respite::Observability
 
 			static void Play(T* a_track)
 			{
+				// Direct concrete calls are covered too, but never gate palette children.
+				if (auto* entry = TopLevelEntryFor(a_track);
+					entry && PolicyEngine::ShouldSuppressSelectedPlay(g_updatingType, entry)) return;
 				const auto before = CaptureTrack(a_track);
-				play(a_track);
+				if constexpr (std::same_as<T, RE::BGSMusicPaletteTrack>) {
+					PaletteDiagnostics::BeforePalettePlay(a_track, g_updatingType);
+					{
+						UpdatingPaletteScope scope{ a_track };
+						play(a_track);
+					}
+					PaletteDiagnostics::AfterPalettePlay(a_track, g_updatingType);
+				} else if constexpr (std::same_as<T, RE::BGSMusicSingleTrack>) {
+					if (g_updatingPalette) {
+						PaletteDiagnostics::BeforeChildPlay(a_track, g_updatingPalette, g_updatingType);
+					}
+					play(a_track);
+					if (g_updatingPalette) {
+						PaletteDiagnostics::AfterChildPlay(a_track, g_updatingPalette, g_updatingType);
+					}
+				} else {
+					play(a_track);
+				}
 				try {
 					{
 						std::scoped_lock lock{ g_stateLock };
@@ -675,15 +764,21 @@ namespace Respite::Observability
 		MusicTypePlayHook::func = musicTypeVTable.write_vfunc(1, MusicTypePlayHook::Thunk);
 		MusicTypeFinishHook::func = musicTypeVTable.write_vfunc(3, MusicTypeFinishHook::Thunk);
 
+		REL::Relocation<std::uintptr_t> wrapperVTable{ RE::VTABLE_BGSMusicTrackFormWrapper[1] };
+		WrapperPlayHook::func = wrapperVTable.write_vfunc(2, WrapperPlayHook::Thunk);
+
 		InstallTrackHooks<SingleTrackHooks>(RE::VTABLE_BGSMusicSingleTrack[0]);
 		InstallTrackHooks<PaletteTrackHooks>(RE::VTABLE_BGSMusicPaletteTrack[0]);
 		InstallTrackHooks<SilenceTrackHooks>(RE::VTABLE_BGSMusicSilenceTrack[0]);
 
-		logs::info("Installed music observability hooks and optional interval replay gate");
-		logs::info("  BSMusicManager::ProcessEvent -> VTABLE_BSMusicManager[0], slot 1");
-		logs::info("  BGSMusicType::DoUpdate/DoPlay/DoFinish -> VTABLE_BGSMusicType[1], slots 0/1/3");
-		logs::info("  Concrete track DoUpdate/DoPlay/DoFinish -> primary vtables, slots 1/2/4");
-		logs::info("  __NoMusic -> identity observation only; no hook installed");
+		logs::info("Installed Respite music hooks");
+		if (Settings::CurrentMusicDiagnosticsEnabled()) {
+			logs::info("[hooks] BSMusicManager::ProcessEvent vtable=BSMusicManager[0] slot=1");
+			logs::info("[hooks] BGSMusicType DoUpdate/DoPlay/DoFinish vtable=BGSMusicType[1] slots=0/1/3");
+			logs::info("[hooks] concrete tracks DoUpdate/DoPlay/DoFinish primary-vtables slots=1/2/4");
+			logs::info("[hooks] selected wrapper DoPlay vtable=BGSMusicTrackFormWrapper[1] slot=2 SE=236546 AE=191038");
+			logs::info("[hooks] __NoMusic identity-only; no hook installed");
+		}
 	}
 
 	void OnDataLoaded()

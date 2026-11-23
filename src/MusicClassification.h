@@ -22,5 +22,6 @@ namespace Respite::MusicClassification
 	};
 
 	[[nodiscard]] Result Classify(RE::BSIMusicType* a_type) noexcept;
+	[[nodiscard]] MusicSubcontext ClassifySelectedSubcontext(RE::BSIMusicTrack* a_entry, MusicContext a_context) noexcept;
 	void Reset() noexcept;
 }

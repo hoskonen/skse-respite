@@ -9,7 +9,8 @@ namespace Respite::MusicClassification
 		struct CachedResult
 		{
 			Result result;
-			bool logged{};
+			bool decisionLogged{};
+			bool verboseLogged{};
 		};
 
 		std::mutex g_cacheLock;
@@ -66,6 +67,9 @@ namespace Respite::MusicClassification
 			}
 
 			const auto editorID = Upper(musicType->GetFormEditorID());
+			if (musicType->GetFormID() == 0x001094A9 || editorID == "MUSDUNGEONCHARGEN") {
+				return { MusicContext::kUnmanaged, Evidence::kExemptEditorID };
+			}
 			if (Contains(editorID, "COMBAT") || Contains(editorID, "DISCOVERY") ||
 				Contains(editorID, "DEATH") || Contains(editorID, "SPECIAL") ||
 				Contains(editorID, "SCRIPTED")) {
@@ -75,6 +79,25 @@ namespace Respite::MusicClassification
 			// Confirmed native records from the current diagnostic traces.
 			if (musicType->GetFormID() == 0x00094BDD) {
 				return { MusicContext::kDungeon, Evidence::kKnownForm };
+			}
+			if (editorID == "DLC2MUSDUNGEONAPOCRYPHA") {
+				return { MusicContext::kDungeon, Evidence::kNativeEditorID };
+			}
+
+			// Exact music types established by PMF's Towns and Cities MTD INIs.
+			// These lack a generic TOWN/CITY token, so resolve them before the
+			// distributed-type rules and current-region exploration fallback.
+			constexpr std::array kPmfTownTypes{
+				std::string_view{ "PMF_FALKREATH" },
+				std::string_view{ "PMF_MARKARTH" },
+				std::string_view{ "PMF_RIFTEN" },
+				std::string_view{ "PMF_SOLITUDE" },
+				std::string_view{ "PMF_WHITERUN" },
+				std::string_view{ "PMF_WINDHELM" },
+				std::string_view{ "PMF_WINTERHOLD" }
+			};
+			if (std::ranges::find(kPmfTownTypes, editorID) != kPmfTownTypes.end()) {
+				return { MusicContext::kTown, Evidence::kDistributedEditorID };
 			}
 
 			const bool distributed = editorID.starts_with("PMF_") || editorID.starts_with("MTD_");
@@ -101,19 +124,30 @@ namespace Respite::MusicClassification
 			return {};
 		}
 
-		void Log(RE::BSIMusicType* a_type, const Result& a_result)
+		[[nodiscard]] std::string TypeName(RE::BSIMusicType* a_type)
 		{
-			if (!Settings::CurrentMusicDiagnosticsEnabled() || !a_type) {
-				return;
+			if (const auto musicType = a_type ? skyrim_cast<RE::BGSMusicType*>(a_type) : nullptr) {
+				if (const std::string_view editorID{ musicType->GetFormEditorID() }; !editorID.empty()) {
+					return std::string{ editorID };
+				}
+				return std::format("{:08X}", musicType->GetFormID());
 			}
-			if (const auto musicType = skyrim_cast<RE::BGSMusicType*>(a_type)) {
-				logs::info(
-					"[classification] type={} form={:08X} editorID='{}' context={} evidence={}",
-					static_cast<const void*>(a_type),
-					musicType->GetFormID(),
-					musicType->GetFormEditorID(),
-					ContextName(a_result.context),
-					EvidenceName(a_result.evidence));
+			return a_type ? "__NoMusic" : "<null>";
+		}
+
+		void LogDecision(RE::BSIMusicType* a_type, const Result& a_result)
+		{
+			logs::info("[context] type={} context={} evidence={}", TypeName(a_type),
+				ContextName(a_result.context), EvidenceName(a_result.evidence));
+		}
+
+		void LogVerbose(RE::BSIMusicType* a_type, const Result& a_result)
+		{
+			if (const auto musicType = a_type ? skyrim_cast<RE::BGSMusicType*>(a_type) : nullptr) {
+				logs::info("[classification-detail] pointer={} form={:08X} editorID='{}' context={} evidence={} priority={} flags={:08X}",
+					static_cast<const void*>(a_type), musicType->GetFormID(), musicType->GetFormEditorID(),
+					ContextName(a_result.context), EvidenceName(a_result.evidence),
+					a_type->priority, a_type->flags.underlying());
 			}
 		}
 	}
@@ -122,17 +156,22 @@ namespace Respite::MusicClassification
 	{
 		try {
 			std::scoped_lock lock{ g_cacheLock };
-			auto [entry, inserted] = g_cache.try_emplace(a_type, CachedResult{ Compute(a_type), false });
+			auto [entry, inserted] = g_cache.try_emplace(a_type, CachedResult{ Compute(a_type), false, false });
 			if (!inserted && entry->second.result.evidence == Evidence::kUnknown) {
 				const auto refreshed = Compute(a_type);
 				if (refreshed.context != entry->second.result.context || refreshed.evidence != entry->second.result.evidence) {
 					entry->second.result = refreshed;
-					entry->second.logged = false;
+					entry->second.decisionLogged = false;
+					entry->second.verboseLogged = false;
 				}
 			}
-			if (!entry->second.logged && Settings::CurrentMusicDiagnosticsEnabled()) {
-				Log(a_type, entry->second.result);
-				entry->second.logged = true;
+			if (!entry->second.decisionLogged) {
+				LogDecision(a_type, entry->second.result);
+				entry->second.decisionLogged = true;
+			}
+			if (!entry->second.verboseLogged && Settings::CurrentMusicDiagnosticsEnabled()) {
+				LogVerbose(a_type, entry->second.result);
+				entry->second.verboseLogged = true;
 			}
 			return entry->second.result;
 		} catch (...) {
